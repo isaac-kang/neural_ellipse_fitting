@@ -5,7 +5,7 @@ import sys
 import time
 import tqdm
 import graph_structures
-#from modules import resfcn256
+import cv2
 
 sys.path.append(os.path.join(os.getcwd(), "code_commons"))
 from global_constants import *
@@ -39,28 +39,36 @@ import dirt_utilities
 
 class CDnet(object):
 
-    def __init__(self, FLAGS=None):
-
-        self.FLAGS = FLAGS
-
-        # input dim
-        """
-        self.input_image_width = IMAGE_WIDTH
-        self.input_image_height = IMAGE_HEIGHT
-        self.input_num_channels = IMAGE_CHANNEL
-        self.training_batch_size = self.FLAGS.batch_size
-
-        self.input_image_size = IMAGE_WIDTH
-        self.max_feature_depth = 256 # 256
-        """
-
+    def __init__(self, args=None):
+        self.args = args
         triangles = []
         for i in range(NUM_BDRY_POINTS):
             triangles.append([i, (i + 1) % NUM_BDRY_POINTS, NUM_BDRY_POINTS])
-
         trinagles = tf.constant(triangles, dtype=tf.int32)
-
         self.trinagles = tf.constant(triangles, dtype=tf.int32)
+
+    def add_alexnet(self, input_tensor):
+        print("add parameter estimation network")
+        with tf.variable_scope("alexnet"):
+            with slim.arg_scope(alexnet.alexnet_v2_arg_scope()):
+                outputs, end_points = alexnet.alexnet_v2(input_tensor, NUM_OF_PARAMETERS_TO_BE_ESTIMATED, global_pool=True)
+        return outputs
+
+    def scale_compensation(self, parameter_vectors_tf):
+        self.angle_scale = 1
+        self.angle_range_scale = 1  # 0.5 mean +90, -90
+        bias = [0, 0, 0, 0.5, 0.5]
+        wght = [300, 300, self.angle_range_scale / self.angle_scale, 300, 200]
+        offset = [IMAGE_WIDTH // 2, IMAGE_HEIGHT // 2, 0, 0, 0]
+        wght = np.array(wght, dtype=np.float32)
+        wght = tf.constant(wght, dtype=tf.float32)
+        bias = np.array(bias, dtype=np.float32)
+        bias = tf.constant(bias, dtype=tf.float32)
+        offset = np.array(offset, dtype=np.float32)
+        offset = tf.constant(offset, dtype=tf.float32)
+        parameter_vectors_tf = (tf.math.sigmoid(parameter_vectors_tf) - 0.5)
+        scaled_parameter_vectors_tf = (parameter_vectors_tf + bias) * wght + offset
+        return scaled_parameter_vectors_tf
 
     def runttime_initialize(self, add_saver=True):
         batch_slice = 1
@@ -83,7 +91,7 @@ class CDnet(object):
             M[0, i, 1] = np.sin(2 * np.pi * i / NUM_BDRY_POINTS)
             M[0, i, 2] = 1.0
         M[0, NUM_BDRY_POINTS, 0] = M[0, NUM_BDRY_POINTS, 1] = 0.0
-        M[0, NUM_BDRY_POINTS, 2] = 1      # center
+        M[0, NUM_BDRY_POINTS, 2] = 1  # center
 
         M = tf.constant(M, tf.float32)
         M = tf.tile(M, [batch_slice, 1, 1])
@@ -109,149 +117,37 @@ class CDnet(object):
         if add_saver is True:
             self.add_saver()
 
-    def add_alexnet(self, input_tensor):
-        print("add parameter estimation network")
-        with tf.variable_scope("alexnet"):
-            with slim.arg_scope(alexnet.alexnet_v2_arg_scope()):
-                outputs, end_points = alexnet.alexnet_v2(input_tensor, NUM_OF_PARAMETERS_TO_BE_ESTIMATED, global_pool=True)
-                #outputs = tf.reshape( outputs, shape = [-1, NUM_BOUNDRY_POINTS, 2])
-
-        return outputs
-
-    def add_validation_env(self, validation_set):
-        print('initializing_tfrecord_for_validation')
-        self.num_validation_samples = 0
-        return
-
-        with tf.variable_scope('tfrecord_open'):
-            self.validation_set = validation_set
-            validation_batch_size = 1
-
-            num_validation_sizes = []
-            num_validation_samples = 0
-            for file in validation_set:
-                num_samples = sum(1 for _ in tf.python_io.tf_record_iterator(file))
-                num_validation_samples += num_samples
-                num_validation_sizes = num_validation_sizes + [num_samples]
-            print(f"validation samples = {num_validation_samples}")
-            self.num_validation_samples = num_validation_samples
-
-            self.validation_data_dict = make_batch(validation_set, validation_batch_size,
-                                                   shuffle=False, num_epochs=10000, MIN_QUEUE_EXAMPLES=10)
-
-        #self.val_input  = tf.placeholder( tf.float32, [None, IMAGE_WIDTH, IMAGE_WIDTH, IMAGE_CHANNEL])
-        #self.val_output = tf.placeholder( tf.float32, [None, IMAGE_WIDTH, IMAGE_WIDTH])
-
-        # with tf.variable_scope('validation_stuff'):
-        #    self.l2_loss = square_sum_error = tf.reduce_mean( tf.square( depth_map - self.val_output) )   #
-
-    def evaluate_validation_loss(self, sess):
-        print('validation_started')
-        tic = time.time()
-        validation_default_batch_size = 1
-        loss_sum = 0.0
-
-        for i in tqdm(range(self.num_validation_samples), total=self.num_validation_samples, leave=False):
-            _data_dict = sess.run(self.validation_data_dict)
-
-            _loss = sess.run(self.l2_loss, feed_dict={self.val_input: _data_dict["image"], self.val_output: _data_dict["depth"]})
-            loss_sum = loss_sum + _loss
-
-        toc = time.time()
-        print(f'elapsed={toc-tic}sec')
-        avg_loss = np.sqrt(loss_sum / self.num_validation_samples)
-        print("avg loss = ", avg_loss)
-        return avg_loss
-
-    def scale_compensation(self, parameter_vectors_tf):
-        # SCALE COMPENSATION
-        # blue
-        self.angle_scale = 1
-        self.angle_range_scale = 1  # 0.5 mean +90, -90
-        bias = [0, 0, 0, 0.5, 0.5]
-        wght = [300, 300, self.angle_range_scale / self.angle_scale, 300, 200]
-        offset = [IMAGE_WIDTH // 2, IMAGE_HEIGHT // 2, 0, 0, 0]
-
-        wght = np.array(wght, dtype=np.float32)
-        wght = tf.constant(wght, dtype=tf.float32)
-
-        bias = np.array(bias, dtype=np.float32)
-        bias = tf.constant(bias, dtype=tf.float32)
-
-        offset = np.array(offset, dtype=np.float32)
-        offset = tf.constant(offset, dtype=tf.float32)
-
-        parameter_vectors_tf = (tf.math.sigmoid(parameter_vectors_tf) - 0.5)
-
-        scaled_parameter_vectors_tf = (parameter_vectors_tf + bias) * wght + offset
-        return scaled_parameter_vectors_tf
-
-    @staticmethod
-    def normalize_scale(estimated_corners):
-        s = tf.constant([IMAGE_HEIGHT // 2, IMAGE_WIDTH // 2], dtype=tf.float32)
-        s = tf.reshape(s, [1, 1, -1])
-
-        """
-        t = tf.constant( [IMAGE_HEIGHT//2,IMAGE_WIDTH//2], dtype = tf.float32 )
-        t = tf.reshape( t, [1,1,-1])
-        """
-
-        estimated_corners = estimated_corners * s
-
-        return estimated_corners
-
     def train_initialize(self, datadir=None, cpu_mode=False):
 
-        # tfrecord
-        if len(datadir) == 1 and os.path.splitext(datadir[0])[-1] == ".tfrecords":
-            batch_data_dict = make_batch(datadir, self.FLAGS.batch_size, shuffle=True, num_epochs=10000)
+        tic = time.time()
+        data_generator = TrainDataGenerator(datadir)
+        toc = time.time()
+        print("---------------------------")
+        print(f'data loading={toc-tic}sec')
+        print("---------------------------")
+        batch_generator = train_data_provider.generate_batch(data_generator,
+                                                             batch_size=self.args.batch_size,
+                                                             num_processes=self.args.num_preprocessing_processes)
+        lock = threading.Lock()
 
-        else:
-            ########################## data pipeline ####################
-            tic = time.time()
-            # random img, mask, center in data dir -> applyt distortion
-            data_generator = TrainDataGenerator(datadir)
-            toc = time.time()
-            print("###########################")
-            print(f'data loading={toc-tic}sec')
-
-            # generate batch
-            batch_generator = train_data_provider.generate_batch(data_generator,
-                                                                 batch_size=self.FLAGS.batch_size,
-                                                                 num_processes=self.FLAGS.num_preprocessing_processes)
-
-            lock = threading.Lock()
-
-            def generate_batch():
-                with lock:
-                    batch_data_list = batch_generator.__next__()
-                return batch_data_list
-            ################################################################
-
-            batch_list = tf.py_func(generate_batch, [], DATA_FIELD_TYPES, stateful=True)
-
-            batch_data_dict = {}
-
-            for idx, name in enumerate(DATA_FIELD_NAMES):
-                batch_data_dict[name] = batch_list[idx]
-                batch_data_dict[name].set_shape((self.FLAGS.batch_size,) + DATA_FIELD_SHAPES[idx])
-                print(DATA_FIELD_NAMES[idx] + ":", batch_data_dict[name].shape, batch_data_dict[name].dtype)
-
+        def generate_batch():
+            with lock:
+                batch_data_list = batch_generator.__next__()
+            return batch_data_list
+        batch_list = tf.py_func(generate_batch, [], DATA_FIELD_TYPES, stateful=True)
+        batch_data_dict = {}
+        for idx, name in enumerate(DATA_FIELD_NAMES):
+            batch_data_dict[name] = batch_list[idx]
+            batch_data_dict[name].set_shape((self.args.batch_size,) + DATA_FIELD_SHAPES[idx])
+            print(DATA_FIELD_NAMES[idx] + ":", batch_data_dict[name].shape, batch_data_dict[name].dtype)
         self.batch_data_dict = batch_data_dict
-
-        if cpu_mode is True:
-            gpus = ['/device:CPU:0']
-            print(gpus)
-        else:
-            gpus = get_available_gpus()
-            print(gpus)
-
+        gpus = get_available_gpus()
         num_gpus = len(gpus)
-        assert(self.FLAGS.batch_size % num_gpus == 0)
-        batch_slice = self.FLAGS.batch_size // num_gpus
-
+        assert(self.args.batch_size % num_gpus == 0)
+        batch_slice = self.args.batch_size // num_gpus
         tower_losses = []
-
+        print('gpus : ', gpus, self.args.gpu)
+        gpus = [gpus[int(self.args.gpu)]]
         for idx_gpu, gpu in enumerate(gpus):
             print(gpu)
             with tf.device(gpu):
@@ -265,7 +161,7 @@ class CDnet(object):
                 mask_axis_x_pts_slice = tf.squeeze(mask_axis_x_pts_slice)
                 mask_axis_y_pts_slice = tf.squeeze(mask_axis_y_pts_slice)
 
-                parameter_vectors_stf = self.add_alexnet(image_slice)      # (batch, NUM_BOUNDRY_POINTS, 2) tf.float32
+                parameter_vectors_stf = self.add_alexnet(image_slice)
                 parameter_vectors_tf = self.scale_compensation(parameter_vectors_stf)
 
                 centerx = parameter_vectors_tf[:, 0:1]
@@ -273,7 +169,7 @@ class CDnet(object):
                 angle = parameter_vectors_tf[:, 2:3]
                 radius1 = parameter_vectors_tf[:, 3:4]
                 radius2 = parameter_vectors_tf[:, 4:5]
-                # a > b # green
+                # a > b
                 radius1 = radius1 + radius2
                 self.centerx = centerx
                 self.centery = centery
@@ -282,21 +178,18 @@ class CDnet(object):
                 self.radius2 = radius2
                 self.estimate_center = tf.concat([self.centerx, self.centery], axis=1)
 
+                # DRAW ELLIPSE (5 estimated parameters -> 20 points + center -> triangularization -> rendering)
                 M = np.zeros(shape=[1, NUM_BDRY_POINTS + 1, 3], dtype=np.float32)
                 for i in range(NUM_BDRY_POINTS):
                     M[0, i, 0] = np.cos(2 * np.pi * i / NUM_BDRY_POINTS)
                     M[0, i, 1] = np.sin(2 * np.pi * i / NUM_BDRY_POINTS)
                     M[0, i, 2] = 1.0
                 M[0, NUM_BDRY_POINTS, 0] = M[0, NUM_BDRY_POINTS, 1] = 0.0
-                M[0, NUM_BDRY_POINTS, 2] = 1      # center
-
+                M[0, NUM_BDRY_POINTS, 2] = 1
                 M = tf.constant(M, tf.float32)
                 M = tf.tile(M, [batch_slice, 1, 1])
-
-                # DRAW ELLIPSE
                 T = transformation(centerx, centery, angle * self.angle_scale, radius1, radius2)
                 M = tf.matmul(M, T)
-
                 frame_width = IMAGE_WIDTH
                 frame_height = -IMAGE_HEIGHT
                 cx = 0
@@ -304,19 +197,17 @@ class CDnet(object):
                 output_dictionary = dirt_utilities.dirt_rendering_orthographic(M, self.trinagles, reflectances=None, frame_width=frame_width, frame_height=frame_height, cx=cx, cy=cy)
                 rendering_result = output_dictionary["rendering_results"][..., 0]
 
+                # region loss
                 error_map = tf.abs(rendering_result - mask_slice)
                 error_map_raw = rendering_result - mask_slice
                 region_loss = 1000.0 * tf.reduce_mean(error_map)
 
+                # center point loss
                 center_points = M[:, -1, :2]
-                area1 = tf.reduce_sum(mask_slice, axis=[1, 2])
-                area2 = 3.141592 * radius1 * radius2
-                area2 = tf.squeeze(area2)
-                area_diff_loss = tf.reduce_mean(tf.abs(area1 - area2))
                 center_distance_loss = tf.abs(center_points - maskcenter_slice)
                 center_distance_loss = tf.math.maximum(center_distance_loss, 5)
                 center_distance_loss = tf.reduce_sum(0.1 * center_distance_loss)
-                # loss = center_distance_loss +  region_loss +  area_diff_loss # magenta
+
                 loss = 10 * center_distance_loss + region_loss
 
                 self.grad_centerx = tf.gradients(loss, self.centerx)
@@ -333,17 +224,12 @@ class CDnet(object):
                 with tf.variable_scope('loss'):
                     tower_losses.append(loss)
 
-                self.add_summary_per_gpu(idx_gpu, image_slice, mask_slice, rendering_result, error_map_raw, center_points, M[:, :, :2], loss, center_distance_loss, region_loss, area_diff_loss)
+                self.add_summary_per_gpu(idx_gpu, image_slice, mask_slice, rendering_result, error_map_raw, center_points, M[:, :, :2], loss, center_distance_loss, region_loss)
 
         if QUANTIZE is True:
             self.add_quant_training_graph()
 
-        """
-        self.print_var_status( var_list = tf.get_collection(tf.GraphKeys.GLOBAL_VARIABLES ) )
-        """
-
         self.loss = tf.reduce_mean(tower_losses)
-
         self.add_gradient()
         self.add_summary()
         self.add_saver()
@@ -363,21 +249,18 @@ class CDnet(object):
         x = tf.concat((x0, x1, x2), axis=-1)
         return x
 
-    def add_summary_per_gpu(self, gpu_idx, image_slice, mask_slice, rendering_result, error_map_raw, center_points, all_points, loss, center_distance_loss, region_loss, area_diff_loss):
-        N = self.FLAGS.num_summary_images
-
-        #tf.summary.histogram("estimated_corners", center_points)
-        #tf.summary.histogram("gt_histogram", mask_slice)
-        #tf.summary.histogram("est_histogram", rendering_result)
+    def add_summary_per_gpu(self, gpu_idx, image_slice, mask_slice, rendering_result, error_map_raw, center_points, all_points, loss, center_distance_loss, region_loss):
+        N = self.args.num_summary_images
 
         with tf.variable_scope('summary_%s' % (gpu_idx)):
             tf.summary.scalar("loss_%s_th_gpu" % (gpu_idx), loss)
             tf.summary.scalar("region_loss_%s_th_gpu" % (gpu_idx), self.region_loss)
             tf.summary.scalar("center_distance_loss_%s_th_gpu" % (gpu_idx), center_distance_loss)
-            # tf.summary.scalar("area_diff_loss_%s_th_gpu"%(gpu_idx), area_diff_loss )
 
             # 1. Input Image
-            image_slice = ((image_slice) / np.sqrt(2.0) + 0.5)
+            edge_slice = ((image_slice) / np.sqrt(2.0) + 0.5)[:, :, :, 3]
+            edge_slice = CDnet.convert_to_color_image(edge_slice)
+            image_slice = ((image_slice) / np.sqrt(2.0) + 0.5)[:, :, :, :3]
             input_with_lines = tf.py_func(draw_circle, [image_slice[:N], self.maskcenter_slice[:N], (1, 0, 0), 3], tf.float32)
 
             # 2. Mask Image
@@ -390,7 +273,7 @@ class CDnet(object):
             images_with_lines = tf.py_func(draw_angle, [images_with_lines[:N], self.estimate_center[:N], self.radius1[:N], self.angle[:N], self.angle_scale,
                                                         self.grad_angle[:N], self.mask_axis_x_pts_slice, self.mask_axis_y_pts_slice], tf.float32)
 
-            # 4. Estimate rener
+            # 4. Estimate render
             rendering_result = CDnet.convert_to_color_image(rendering_result)
             rendering_result = tf.py_func(draw_grad, [rendering_result[:N], self.grad_centerx[:N], self.grad_centery[:N], self.grad_angle[:N],
                                                       self.grad_radius1[:N], self.grad_radius2[:N]], tf.float32)
@@ -398,23 +281,16 @@ class CDnet(object):
             # 5. Error map
             error_map = CDnet.convert_raw_to_color_image(error_map_raw)
 
-            """
-        
-            images_with_lines = tf.py_func( draw_triangles, \
-                [ image_slice[:N], estimated_corners[:N] ], tf.float32 )            
-            """
-
             input_prediction = 255.0 * tf.concat(
                 [input_with_lines[:N],
-                 mask_slice[:N],
+                 edge_slice[:N],
                  images_with_lines,
-                 rendering_result[:N],
                  error_map[:N]
                  ], axis=2)
             input_prediction = tf.clip_by_value(input_prediction, 0.0, 255.0)
 
-            input_prediction = tf.image.resize_bilinear(input_prediction, (IMAGE_HEIGHT, IMAGE_WIDTH * 5))
-            tf.summary.image("input_prediction gpu:%s" % (gpu_idx), input_prediction, max_outputs=N)
+            self.input_prediction = tf.image.resize_bilinear(input_prediction, (IMAGE_HEIGHT, IMAGE_WIDTH * 4))
+            tf.summary.image("input_prediction gpu:%s" % (gpu_idx), self.input_prediction, max_outputs=N)
 
     def add_saver(self):
         self.saver = tf.train.Saver(max_to_keep=5)
@@ -449,9 +325,9 @@ class CDnet(object):
             self.global_step = tf.Variable(0, trainable=False)
 
             self.learning_rate = tf.train.exponential_decay(
-                learning_rate=self.FLAGS.learning_rate,
+                learning_rate=self.args.learning_rate,
                 global_step=self.global_step,
-                decay_steps=self.FLAGS.num_samples_per_learning_rate_half_decay / self.FLAGS.batch_size,
+                decay_steps=self.args.num_samples_per_learning_rate_half_decay / self.args.batch_size,
                 decay_rate=0.5)
 
             optimizer = tf.train.AdamOptimizer(self.learning_rate)
@@ -465,13 +341,13 @@ class CDnet(object):
             self.summaries = tf.summary.merge_all()
 
     def occasional_jobs(self, sess, global_step):
-        ckpt_filename = os.path.join(self.FLAGS.train_dir, "myckpt")
+        ckpt_filename = os.path.join(self.args.train_dir, "myckpt")
 
-        if global_step % self.FLAGS.save_every == 0:
+        if global_step % self.args.save_every == 0:
             save_path = self.saver.save(sess, ckpt_filename, global_step=global_step)
             tqdm.write("saved at" + save_path)
 
-        # if global_step % self.FLAGS.eval_every == 0 and self.num_validation_samples != 0:
+        # if global_step % self.args.eval_every == 0 and self.num_validation_samples != 0:
         #     eval_loss = self.evaluate_validation_loss(sess)
         #     print("evaluation loss:", eval_loss)
         #     summary = tf.Summary()
@@ -481,12 +357,12 @@ class CDnet(object):
 
         # write examples to the examples directory
         """
-        if  global_step % self.FLAGS.save_examples_every == 0:
+        if  global_step % self.args.save_examples_every == 0:
             print("save examples - nothing done")            
         """
 
     def train(self, sess):
-        self.writer = tf.summary.FileWriter(self.FLAGS.train_dir, sess.graph)
+        self.writer = tf.summary.FileWriter(self.args.train_dir, sess.graph)
 
         exp_loss = None
         counter = 0
@@ -504,8 +380,9 @@ class CDnet(object):
                     "loss": self.loss
                 }
 
-                if iter % self.FLAGS.summary_every == 0:
+                if iter % self.args.summary_every == 0:
                     output_feed["summaries"] = self.summaries
+                    output_feed["save_images"] = self.input_prediction
 
                 _results = sess.run(output_feed)
 
@@ -520,8 +397,16 @@ class CDnet(object):
                 global_step = _results["global_step"]
                 learning_rate = _results["learning_rate"]
 
-                if iter % self.FLAGS.summary_every == 0:
+                if iter % self.args.summary_every == 0:
                     self.writer.add_summary(_results["summaries"], global_step=global_step)
+                    save_images = _results["save_images"]
+                    for idx, input_pred in enumerate(save_images):
+                        save_img = input_pred if idx == 0 else np.concatenate((save_img, input_pred), axis=0)
+                    save_img = cv2.cvtColor(save_img, cv2.COLOR_BGR2RGB)
+                    number = np.random.randint(100)
+                    if not os.path.exists(self.args.save_imgs_dir):
+                        os.makedirs(self.args.save_imgs_dir)
+                    cv2.imwrite(self.args.save_imgs_dir + '/' + str(number).zfill(2) + '.png', save_img)
 
                 cur_loss = _results["loss"]
 
